@@ -4,10 +4,11 @@
 # against build/linux/<arch>/deps and the seed generator helper (tools/linux/rando_helper.sh) put together
 # as an AppDir and packed by appimagetool: build/dist/LAS Recomp-<version>-linux-<arch>.AppImage
 # (named like the macOS / Windows releases; GitHub shows it as LAS.Recomp-<version>-linux-<arch>.AppImage).
-# Shipped next to the executable (usr/bin, where runtime/paths.c rt_resource looks): rando-gen/, what the start screen
-# builds the game code with on the player's machine (runtime/gamebuild.c: lasgen/, zig/ from tools/fetch_zig.sh,
-# gamelib-src/), the window icon, the start screen font. No game code: that's built from the player's own files. usr/lib: the libraries from deps/ only - glibc, libstdc++, the Vulkan loader and the
-# GPU drivers are the system's (a bundled loader would not find the user's drivers). No game files or fonts.
+# Shipped next to the executable (usr/bin, where runtime/paths.c rt_resource looks): zaimport/ to read the player's
+# packages, rando-gen/, what the start screen builds the game code with on the player's machine (runtime/gamebuild.c:
+# lasgen/, zig/ from tools/fetch_zig.sh, gamelib-src/), the window icon, the start screen font. No game code: that's
+# built from the player's own files. usr/lib: the libraries from deps/ only - glibc, libstdc++, the Vulkan loader and
+# the GPU drivers are the system's (a bundled loader would not find the user's drivers). No game files or fonts.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 ARCH=$1
@@ -35,6 +36,16 @@ make -j"$JOBS" B="$B" DEPS="$P" SHADERC=-lshaderc_shared "${MAKEARGS[@]}" "$B/la
 if nm "$B/lasrecomp" | grep ' f_70' >/dev/null; then echo "$B/lasrecomp has game code linked in"; exit 1; fi
 ZIG_TARGET=$ARCH-linux tools/fetch_zig.sh
 
+# the game file importer (self-contained: no .NET needed on the player's machine)
+case "$ARCH" in x86_64) DOTNET_RID=linux-x64 ;; aarch64) DOTNET_RID=linux-arm64 ;; esac
+if [ -n "${ZAIMPORT_BINARY:-}" ]; then
+    install -D -m 755 "$ZAIMPORT_BINARY" "$L/zaimport/zaimport"
+else
+    dotnet restore tools/zaimport -r "$DOTNET_RID"
+    dotnet publish tools/zaimport -c Release -r "$DOTNET_RID" --no-restore --self-contained true -p:PublishSingleFile=true \
+        -p:EnableCompressionInSingleFile=true -p:DebugType=none -o "$L/zaimport"
+fi
+
 # ---- AppDir
 rm -rf "$APPDIR" && mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib"
 cp "$B/lasrecomp" "$APPDIR/usr/bin/"
@@ -51,6 +62,8 @@ cp README.md LICENSE "$APPDIR/usr/bin/"  # (licenses and source links of the bun
 cp -R "$L/helper/rando-gen" "$APPDIR/usr/bin/"
 [ -d "$L/helper/lasgen" ] || { echo "no game code generator helper: tools/linux/rando_helper.sh $ARCH first"; exit 1; }
 cp -R "$L/helper/lasgen" build/zig "$APPDIR/usr/bin/"
+mkdir "$APPDIR/usr/bin/zaimport"
+cp "$L/zaimport/zaimport" "$APPDIR/usr/bin/zaimport/"
 mkdir "$APPDIR/usr/bin/gamelib-src"
 cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
    "$APPDIR/usr/bin/gamelib-src/"

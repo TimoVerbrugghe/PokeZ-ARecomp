@@ -20,11 +20,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxkbcommon-dev libwayland-dev wayland-protocols libdecor-0-dev libegl-dev libgl-dev libdrm-dev libgbm-dev \
         libpulse-dev libasound2-dev libpipewire-0.3-dev libdbus-1-dev libudev-dev libibus-1.0-dev \
         libvulkan-dev \
+    && curl -fsSL https://packages.microsoft.com/config/ubuntu/22.04/packages-microsoft-prod.deb \
+        -o /tmp/packages-microsoft-prod.deb \
+    && dpkg -i /tmp/packages-microsoft-prod.deb \
     # clang 21 from apt.llvm.org: 22.04's clang 15 lacks the __builtin_elementwise_* the lifted FP code uses (simd_fp.h)
     && curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /etc/apt/trusted.gpg.d/apt.llvm.org.asc \
     && echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-21 main" > /etc/apt/sources.list.d/llvm.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends clang-21 lld-21 llvm-21 \
+        dotnet-sdk-8.0 \
     && rm -rf /var/lib/apt/lists/* \
     && for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-ranlib llvm-strip; do ln -sf $t-21 /usr/bin/$t; done \
     && arch=$(uname -m) \
