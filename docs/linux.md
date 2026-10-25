@@ -79,9 +79,9 @@ RELEASE or NOT READY; `build/smoke/sheet.png` shows every screenshot. It needs `
 save outside git (`~/.local/share/lasrecomp-smoketest/save`, or `LARECOMP_SMOKE_SAVE`): copy `save/` from any build
 after starting a new game once.
 
-The AppImage holds `lasrecomp`, `rando-gen/`, the start screen font and the bundled libraries (SDL3,
-FFmpeg, shaderc). Not bundled: glibc, libstdc++, the Vulkan loader and the GPU drivers (always the system's). No game
-files or fonts.
+The AppImage holds `lasrecomp`, the game-file importer (`zaimport/`), `rando-gen/`, the start screen font and the bundled
+libraries (SDL3, FFmpeg, shaderc). Not bundled: glibc, libstdc++, the Vulkan loader and the GPU drivers (always the
+system's). No game files or fonts.
 
 ## Differences from macOS / Windows
 - Platform layer `runtime/platform/linux.c`: like macOS, the guest window (0x70_0000_0000..0x73_2000_0000) is one
