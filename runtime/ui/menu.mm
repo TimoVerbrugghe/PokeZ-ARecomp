@@ -33,6 +33,7 @@ void save_editor_on_open(void);
 void rando_tab_draw(float scale);
 bool warp_tab_draw(float scale);  // warp_tab.mm: true when a warp started
 extern "C" void cheats_draw(float scale);  // cheats.mm
+extern "C" int settings_on_steam_deck(void);  // settings.c
 extern "C" void difficulty_draw(float scale);  // difficulty.mm
 void controls_bindings_draw(float scale);  // controls_ui.mm
 #include "../input_bind.h"
@@ -485,6 +486,18 @@ static void tab_display(void) {
                 g_settings.game_drs = dr == 1;
         }
     }
+    {   // the mode the game is told it runs in (runtime/services/am.c): read when the game starts
+        extern bool g_za_frame_hook;
+        if (g_za_frame_hook) {
+            int hh = g_settings.opmode;
+            static const char *modes[] = {"Auto (handheld on a Steam Deck)", "Docked (1080p)", "Handheld (720p)"};
+            if (opt_choice("Game mode", &hh, modes, 3, 0,
+                           "The mode the game believes it runs in, from the next start. Handheld: the game draws 720p and lighter "
+                           "effects, like on the Switch's own screen - far less for the GPU (a Steam Deck: ~25 fps instead of ~12). "
+                           "Docked: 1080p. Auto picks handheld on a Steam Deck."))
+                g_settings.opmode = hh;
+        }
+    }
     {   // HD texture pack (textures/hd: runtime/nvn/vulkan/textures.c hd_switch, tools/za/hd_pack.py): switches at once
         int tx = g_settings.tex_hd ? 1 : 0;
         static const char *tex[] = {"Original", "HD"};
@@ -624,9 +637,9 @@ static void tab_about(void) {
     {
         static const char *const fam[] = {"Nintendo", "Xbox", "PlayStation"};
         char autol[64];
-        snprintf(autol, sizeof autol, "Auto (%s)", fam[input_pad_family() % 3]);
-        const char *names[] = {autol, "Nintendo", "Xbox", "PlayStation", "Keyboard"};  // (Keyboard: Z-A, from the next boot)
-        choice("Button icons", &g_settings.prompts, names, 5);
+        snprintf(autol, sizeof autol, "Auto (%s)", input_pad_family() == 1 && settings_on_steam_deck() ? "Steam Deck" : fam[input_pad_family() % 3]);
+        const char *names[] = {autol, "Nintendo", "Xbox", "PlayStation", "Keyboard", "Steam Deck"};  // (Keyboard, Steam Deck: Z-A, from the next boot)
+        choice("Button icons", &g_settings.prompts, names, 6);
     }
     ImGui::Spacing();
     header("System language");

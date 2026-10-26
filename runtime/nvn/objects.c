@@ -128,6 +128,11 @@ static void exec_lock_init(void) {
 static void exec_lock_take(void) { pthread_once(&exec_lock_once, exec_lock_init); pthread_mutex_lock(&exec_lock); }
 static void exec_lock_give(void) { pthread_mutex_unlock(&exec_lock); }
 
+// What the game presents: the crop it set on the window (nvnWindowSetCrop: x, y, w, h in texels) and the size of the window texture, in the game's own
+// units (before the render scale). Handheld mode presents a 1280x720 part of a 1920x1080 texture; the backend shows only that part.
+int g_present_crop[4];
+int g_present_tex[2];
+
 NVN(nvnQueueSubmitCommands) {
     int n = (int)A(1);
     const uint64_t *handles = AP(2);
@@ -703,6 +708,8 @@ static void present_pace(int interval) {
     if (forced >= 0) interval = forced;
     static int logged = -12345;
     if (interval != logged) { logged = interval; LOG("[nvn] present interval %d\n", interval); }
+    extern int g_out_present_interval;  // (output_scale.c: dynamic resolution's frame budget)
+    g_out_present_interval = interval;
     if (interval <= 0) return;
     if (interval > 4) interval = 1;  // (not a sane interval: the console's default)
     uint64_t period = 16666667ull * (uint64_t)interval, now = plat_now_ns();
@@ -715,6 +722,17 @@ NVN(nvnQueuePresentTexture) {
     NvnWindow *w = HOST(NvnWindow, A(1));
     int i = (int)A(2);
     if (i >= 0 && i < w->num) {
+        {   // [present] the size of what the game presents and its crop, logged when either changes
+            static int lw, lh, lc[4];
+            NvnTexture *pt = HOST(NvnTexture, w->textures[i]);
+            if (pt && (lw != (int)pt->width || lh != (int)pt->height || memcmp(lc, w->crop, sizeof lc))) {
+                lw = (int)pt->width, lh = (int)pt->height, memcpy(lc, w->crop, sizeof lc);
+                LOG("[present] window texture %dx%d, crop %d,%d %dx%d, interval %d\n", lw, lh, lc[0], lc[1], lc[2], lc[3], (int)w->interval);
+            }
+            memcpy(g_present_crop, w->crop, sizeof g_present_crop);
+            g_present_tex[0] = pt ? (int)pt->width : 0;
+            g_present_tex[1] = pt ? (int)pt->height : 0;
+        }
         present_pace(w->interval);
         backend_present(HOST(NvnTexture, w->textures[i]));
         if (i < 8) w->present_seq[i] = renderer_fence_seq();  // (the submission just presented)

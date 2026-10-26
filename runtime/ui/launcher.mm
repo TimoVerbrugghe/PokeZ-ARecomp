@@ -100,7 +100,7 @@ static const char *build_version(const uint8_t id[8]) {
 static bool build_is_za(const uint8_t id[8]) { return build_version(id) && memcmp(id, BUILD_ID, 8); }
 // The release tag this build is (also names the release files; Makefile / tools/bundle_macos.sh / make_dmg.sh read
 // it): ZA Recomp's v<major>.<minor>.<patch> (Hexveil404/PokeZ-ARecomp releases).
-#define LARECOMP_VERSION "v0.1.5"
+#define LARECOMP_VERSION "v0.1.7"
 extern "C" const char *rt_version(void) { return LARECOMP_VERSION; }  // (runtime/main.c: the log's first line)
 
 // ------------------------------------------------------------------ update check
@@ -478,7 +478,7 @@ static bool import_packages(const std::vector<std::string> &pkgs, const std::str
 // Controls tab (both in the background: from the next start). zaprompts --install draws them into textures/prompts.new
 // and swaps that in whole itself (a game never sees half a set). Up to 3 tries per stamp (textures/prompts.tried):
 // failing leaves the game's own icons. Log: textures/prompts.log.
-#define PROMPTS_VERSION "2"
+#define PROMPTS_VERSION "3"
 static std::atomic<bool> g_prompts_busy{false};
 static PlatProc g_prompts_proc;  // (the one left running: a newer rebind ends it and starts over)
 static std::string prompts_stamp(void) {
