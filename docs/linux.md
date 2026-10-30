@@ -66,6 +66,8 @@ The randomizer from a source checkout uses LAS-Randomizer's own venv (Python 3.1
     third_party/LAS-Randomizer/venv/bin/pip install -r third_party/LAS-Randomizer/requirements.txt
 
 ## AppImages
+The bundled FSR2 sources use non-Windows export declarations and wide-string helpers for Linux builds.
+
 Needs podman, and for the other arch's AppImage QEMU user emulation with binfmt (`sudo apt install podman qemu-user
 qemu-user-binfmt`).
 

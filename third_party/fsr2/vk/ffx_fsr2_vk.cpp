@@ -27,6 +27,10 @@
 #include <math.h>
 #include <stdlib.h>
 #include <codecvt>
+#ifndef _WIN32
+#include <wchar.h>
+#define wcscpy_s(dst, src) wcscpy(dst, src)
+#endif
 
 #ifndef _WIN32  // (ZA Recomp: the MSVC helper used below, for Linux builds; as in ../ffx_fsr2.cpp)
 #include <wchar.h>
