@@ -200,9 +200,9 @@ static void boot(const char *root) {
     {   // the window and graphics device first (normally made by the start screen or ui_run), so the guest heap can be
         // the driver's memory before any game thread runs (runtime/nvn/vulkan/exec.c backend_guest_heap_prepare)
         extern void ui_window_init(void);
-        extern void backend_guest_heap_prepare(void);
+        extern void backend_guest_heap_prepare(const char *game_dir);
         ui_window_init();
-        backend_guest_heap_prepare();
+        backend_guest_heap_prepare(root);
     }
 #endif
     char why[512];

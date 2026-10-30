@@ -154,6 +154,11 @@ Switches: `LARECOMP_VK_CS_SUBGROUP=0` leaves compute to the driver's 64-lane wav
 `vkQueueSubmit2`). `perf record -t <render thread>` sees user space only (perf_event_paranoid=2); the `[vk] t=` log line's
 `submit` ms shows the kernel time inside the submit ioctl.
 
+Z-A imports its physical-memory window, not Link's Awakening's driver-allocated heap. A log showing
+`guest heap as driver memory` followed by Z-A's `guest memory window: physical memory` indicates an older runtime
+that can leave objects undrawn. Update the runtime; `LARECOMP_VK_HEAP_DMABUF=0` is a workaround for those builds.
+Recompiling the game code is not needed for this fix.
+
 ## ZA Recomp on Linux (native, x86-64)
 Experimental. ZA Recomp builds and runs natively on Linux x86-64 (no Wine / Proton) and can be packaged as an
 AppImage. Most of what makes that possible was already here, from LAS Recomp: the Linux platform layer

@@ -16,6 +16,7 @@
 #include <unistd.h>
 #endif
 
+#include "../../game_addresses.h"
 #include "../../kernel.h"
 #include "shaders.h"
 #include "vk.h"
@@ -4296,10 +4297,13 @@ static const char *heap_tracking_reason(void) {  // (overlap_on: why there is no
 // The whole heap as one userptr import (not chunks) on AMD: each submission has amdgpu check all of its pages
 static bool heap_whole_userptr(void) { return gmem_userptr && !gc_lazy && g_vk.props.vendorID == 0x1002; }
 
-void backend_guest_heap_prepare(void) {
+void backend_guest_heap_prepare(const char *game_dir) {
     gmem_userptr = false;
 #ifdef __linux__
-    guest_heap_dmabuf();
+    // Pokémon Z-A has no heap at HEAP_BASE: reusing that buffer for its physical window makes shader reads empty.
+    // The program flag is set later in boot, so check the selected files (LARECOMP_VK_HEAP_DMABUF=0 also disables it).
+    if (game_files_are_la(game_dir)) guest_heap_dmabuf();
+    else LOG("[vk] guest heap: no driver allocation (not Link's Awakening); importing the game's physical window\n");
 #endif
     if (!g_vk.dev) return;
     gmem_chunk_shift();  // (the chunk / lazy decision, before the first draw binds anything)
