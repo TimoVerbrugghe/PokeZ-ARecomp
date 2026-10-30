@@ -27,6 +27,10 @@
 #include <math.h>
 #include <stdlib.h>
 #include <codecvt>
+#ifndef _WIN32
+#include <wchar.h>
+#define wcscpy_s(dst, src) wcscpy(dst, src)
+#endif
 
 // prototypes for functions in the interface
 FfxErrorCode GetDeviceCapabilitiesVK(FfxFsr2Interface* backendInterface, FfxDeviceCapabilities* deviceCapabilities, FfxDevice device);

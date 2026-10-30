@@ -22,8 +22,9 @@
 #pragma once
 
 #include <stdint.h>
+#include <stddef.h>
 
-#if defined (FFX_GCC)
+#if defined (FFX_GCC) || !defined(_WIN32)
 /// FidelityFX exported functions
 #define FFX_API
 #else
