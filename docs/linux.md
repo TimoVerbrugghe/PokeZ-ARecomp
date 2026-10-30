@@ -153,3 +153,8 @@ Switches: `LARECOMP_VK_CS_SUBGROUP=0` leaves compute to the driver's 64-lane wav
 `LARECOMP_VK_GMEM_WINDOW=0` imports the whole 3.2 GB heap again (87 % of the render thread then goes into
 `vkQueueSubmit2`). `perf record -t <render thread>` sees user space only (perf_event_paranoid=2); the `[vk] t=` log line's
 `submit` ms shows the kernel time inside the submit ioctl.
+
+Z-A imports its physical-memory window, not Link's Awakening's driver-allocated heap. A log showing
+`guest heap as driver memory` followed by Z-A's `guest memory window: physical memory` indicates an older runtime
+that can leave objects undrawn. Update the runtime; `LARECOMP_VK_HEAP_DMABUF=0` is a workaround for those builds.
+Recompiling the game code is not needed for this fix.
