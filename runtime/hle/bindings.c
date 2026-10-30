@@ -7,6 +7,7 @@
 
 #include "../hle.h"
 #include "../input_bind.h"
+#include "../settings.h"
 
 _Static_assert(PADB_LTRIGGER == SDL_GAMEPAD_BUTTON_COUNT, "trigger pseudo-buttons follow SDL's buttons");
 
@@ -45,6 +46,7 @@ int bind_mouse_from_sdl(int b) {
     }
 }
 void bind_mouse_reset(void) { memcpy(g_bind_mouse, k_def_mouse, sizeof g_bind_mouse); }
+int bind_mouse_default(int mb) { return mb >= 0 && mb < MOUSEB_COUNT ? k_def_mouse[mb] : -1; }
 bool bind_mouse_is_default(void) { return !memcmp(g_bind_mouse, k_def_mouse, sizeof g_bind_mouse); }
 
 static const char *const k_ini[BIND_KEY_COUNT] = {
@@ -74,7 +76,7 @@ int bind_pad_from_name(const char *name) {
 
 const char *bind_input_name(int slot) { return slot >= 0 && slot < BIND_KEY_COUNT ? k_names[slot] : "?"; }
 
-// fam: 0 Nintendo (and pads SDL doesn't name), 1 Xbox, 2 PlayStation
+// fam: 0 Nintendo, 1 Xbox (and pads SDL labels like one), 2 PlayStation
 const char *bind_pad_label(int host, int fam) {
     static const char *const nin[PADB_HOST_COUNT] = {
         "B", "A", "Y", "X", "Minus", "Home", "Plus", "Left stick press", "Right stick press", "L", "R",
@@ -108,9 +110,21 @@ int bind_label_family(void) {
     int n = 0, t = 0;  // start screen: input.c hasn't opened a pad yet
     SDL_JoystickID *ids = SDL_GetGamepads(&n);
     if (ids && n > 0) t = SDL_GetGamepadTypeForID(ids[0]);
+    bool any = ids && n > 0;
     SDL_free(ids);
-    return t == SDL_GAMEPAD_TYPE_XBOX360 || t == SDL_GAMEPAD_TYPE_XBOXONE ? 1 :
-           t == SDL_GAMEPAD_TYPE_PS3 || t == SDL_GAMEPAD_TYPE_PS4 || t == SDL_GAMEPAD_TYPE_PS5 ? 2 : 0;
+    return any ? input_family_of_type(t) : 0;
+}
+
+// What "Auto" button icons stand for right now (PROMPTS_*, never AUTO), by the same rule runtime/hle/pl.c
+// pl_prompt_set uses at boot: a Steam Deck (unless a PlayStation pad is on it) its own; no controller the keyboard's;
+// else the controller's family. (The menus' "Auto (...)" names this.)
+int bind_prompts_auto(void) {
+    extern int settings_on_steam_deck(void);  // runtime/settings.c
+    bool pad = SDL_HasGamepad();
+    int fam = pad ? bind_label_family() : 0;
+    if (settings_on_steam_deck() && fam != 2) return PROMPTS_STEAMDECK;
+    if (!pad) return PROMPTS_KEYBOARD;
+    return fam == 1 ? PROMPTS_XBOX : fam == 2 ? PROMPTS_PLAYSTATION : PROMPTS_NINTENDO;
 }
 
 static void result(int kind, int dev, int slot, int other);
@@ -131,6 +145,7 @@ bool bind_is_default_slot(int dev, int slot) {
 }
 
 int bind_prompt_host(int slot) { return slot >= 0 && slot < BIND_PAD_COUNT ? g_bind_pad[slot] : -1; }
+int bind_pad_default(int slot) { return slot >= 0 && slot < BIND_PAD_COUNT ? k_def_pad[slot] : -1; }
 
 // ------------------------------------------------------------------ capture
 static _Atomic int cap_dev = -1, cap_slot = -1;
@@ -193,9 +208,10 @@ bool bind_capture_event(const SDL_Event *e) {
     case SDL_EVENT_KEY_DOWN:
         if (e->key.repeat) return true;
         if (e->key.scancode == SDL_SCANCODE_ESCAPE) { bind_capture_cancel(); return true; }
-        // F1 (menu), F9 (frame dump), F11 (fullscreen) stay the overlay's; a controller capture ignores keys
+        // F1 (menu), F9 (frame dump), F10 (screenshot), F11 (fullscreen) stay the overlay's; a controller capture ignores keys
         if (dev != BIND_DEV_KEY || e->key.scancode == SDL_SCANCODE_F1 || e->key.scancode == SDL_SCANCODE_F9 ||
-            e->key.scancode == SDL_SCANCODE_F11 || e->key.scancode >= SDL_SCANCODE_COUNT) return true;
+            e->key.scancode == SDL_SCANCODE_F10 || e->key.scancode == SDL_SCANCODE_F11 ||
+            e->key.scancode >= SDL_SCANCODE_COUNT) return true;
         cap_dev = -1;
         assign(dev, cap_slot, e->key.scancode);
         return true;

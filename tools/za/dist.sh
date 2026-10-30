@@ -30,12 +30,12 @@ build/gen-venv/Scripts/python.exe tools/pe_no_cfg.py build/helper/lasgen/lasgen.
 # 2b. the button icon maker (tools/za/prompt_textures.py + ooz, GPLv3: third_party/ooz/README.ZARecomp.md)
 mkdir -p build/ooz
 (cd third_party/ooz && g++ -O2 -shared -static -include sys/stat.h -Dmain=ooz_main kraken.cpp bitknit.cpp lzna.cpp \
-    ooz_lib.cpp -o ../../build/ooz/ooz.dll)
-if [ ! -f build/prompts-venv/.ok ]; then
+    ooz_lib.cpp -o ../../build/ooz/ooz.dll -Wl,-u,__mingw_fe_dfl_env)  # (-u: newer MinGW libmingwex needs CRT_fp10 from libmingw32)
+if [ ! -f build/prompts-venv/.ok2 ]; then  # (.ok2: texture2ddecoder, the team icons' BC7)
     py -3.12 -m venv build/prompts-venv
-    build/prompts-venv/Scripts/python.exe -m pip install -q pillow==13.0.0 numpy==2.5.4 fonttools==4.67.0 cffsubr==0.4.0 \
+    build/prompts-venv/Scripts/python.exe -m pip install -q pillow==13.0.0 numpy==2.5.4 fonttools==4.67.0 cffsubr==0.4.0 texture2ddecoder==1.0.6 \
         pyinstaller==6.22.3
-    touch build/prompts-venv/.ok
+    touch build/prompts-venv/.ok2
 fi
 USERPROFILE="$(cygpath -w ~)" build/prompts-venv/Scripts/python.exe -m PyInstaller --noconfirm --clean --log-level WARN \
     --distpath build/helper --workpath build/pyinstaller-prompts tools/zaprompts.spec
@@ -68,7 +68,8 @@ cp third_party/fonts/Baloo2/OFL.txt "$D/Baloo2-OFL.txt"
 cp README.md LICENSE "$D/"
 [ -f README.pt-BR.md ] && cp README.pt-BR.md "$D/"
 cp tools/za/za-default.ini "$D/larecomp.ini"
-PATH="$PWD/build/deps-win/bin:$PATH" ldd $B/lasrecomp.exe | awk '(/ucrt64/ || /deps-win/) && !/vulkan-1/ {print $3}' | sort -u |
+# (every DLL but Windows' own and the Vulkan loader: also when copies sit next to the exe in $B, a dev setup)
+PATH="$PWD/build/deps-win/bin:$PATH" ldd $B/lasrecomp.exe | awk 'tolower($3) !~ /^\/c\/windows\// && !/vulkan-1/ {print $3}' | sort -u |
     while read -r f; do cp "$f" "$D/"; done
 ! ls "$D" | grep -iE 'x264|x265|xvid|postproc'  # (no GPL codec libraries in the release)
 du -sh "$D"

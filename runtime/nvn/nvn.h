@@ -31,8 +31,9 @@ typedef struct NvnTexture {
     uint64_t pool_offset;
     void *backend;  // renderer-side texture
     uint64_t debug_id;
+    uint32_t pool_refs;  // texture pool entries that name it (cleared when it is finalized: runtime/nvn/objects.c)
+    bool format_views;   // named through a view in a format the backend can only give with a flag (Metal: PixelFormatView)
     char label[64];
-    bool in_pool;  // registered in a texture pool once (its entries are cleared when it's finalized: objects.c)
 } NvnTexture;
 
 // Also kept inside the guest's NVNsamplerBuilder (at +8, runtime/nvn/objects.c), which is 64 bytes: Pokémon Legends
@@ -42,6 +43,7 @@ typedef struct {
     float lod_min, lod_max, lod_bias, max_aniso;
     float border[4];
     void *backend;
+    uint32_t backend_gen;  // (Vulkan textures.c vk_sampler: the sampler settings backend was made with)
 } NvnSamplerDesc;
 _Static_assert(8 + sizeof(NvnSamplerDesc) <= 64, "NvnSamplerDesc must fit an NVNsamplerBuilder");
 
@@ -53,11 +55,22 @@ typedef struct {
 } NvnTextureView;  // our layout inside the guest NVNtextureView
 _Static_assert(sizeof(NvnTextureView) <= 32, "NvnTextureView must fit the guest's");
 
+// A view naming a texture (pool entry, render target, clear, copy): one in another format is told to the backend before
+// the texture is used through it.
+void backend_texture_view_format(NvnTexture *tex, uint32_t format);  // (runtime/nvn/metal.m, vulkan/textures.c)
+static inline void nvn_texture_note_view(NvnTexture *t, const NvnTextureView *v) {
+    if (t && v && (v->setmask & 4) && v->format != t->format) backend_texture_view_format(t, v->format);
+}
+
 typedef struct {
     NvnTexture *tex;
     NvnTextureView view;
     bool has_view;
+    uint32_t dead_format;  // the texture registered here was finalized (NVN format + 1; 0 = no): tex is NULL
 } NvnTexEntry;
+
+// A draw named a texture pool slot whose texture was finalized (runtime/nvn/objects.c): logged, a few times
+void nvn_dead_slot_sampled(const NvnTexEntry *e, uint32_t slot);
 
 typedef struct NvnDescPool {
     uint64_t addr;
@@ -138,6 +151,11 @@ enum {
 // renderer backend (runtime/nvn/metal.m)
 void backend_init(void);
 void backend_execute(uint64_t handle);            // run a recorded command list
+void backend_execute_batch(const uint64_t *handles, int n);  // the lists of one nvnQueueSubmitCommands
 void backend_present(NvnTexture *tex);            // show a texture in the window
 void backend_texture_destroyed(NvnTexture *tex);
+// nvnTextureReadTexels[Strided]: the texture's region (view: the guest's NVNtextureView or NULL; region: x, y, z, w, h, d)
+// into data, rows / images that many bytes apart (0: packed). Its current contents, as the GPU last left them.
+void backend_texture_read(NvnTexture *tex, const void *view, const int32_t region[6], void *data, uint64_t row_stride,
+                          uint64_t image_stride);
 void backend_pool_written(uint64_t addr, uint64_t size);

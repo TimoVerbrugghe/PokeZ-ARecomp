@@ -1,7 +1,7 @@
 // Control remapping (runtime/hle/bindings.c): which controller button / key drives each Switch input. Edited from
 // the in-game menu's Controls tab and the start screen (runtime/ui/controls_ui.mm), saved in larecomp.ini.
-// Menus (the overlay, the start screen) never use these: they keep the fixed default layout, so no binding can lock
-// the player out.
+// Menus (the overlay, the start screen) never use these, so no binding can lock the player out: they follow the
+// game's layout, or the controller's own (Confirm button; runtime/ui/pad_nav.h).
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
@@ -35,12 +35,16 @@ extern int16_t g_bind_mouse[MOUSEB_COUNT];
 const char *bind_mouse_name(int mb);           // "Left button"
 int bind_mouse_from_sdl(int sdl_button);       // SDL_BUTTON_* -> MOUSEB_* (-1: another button)
 void bind_mouse_reset(void);
+int bind_mouse_default(int mb);                 // the BIND_* that mouse button presses by default (-1: none)
 bool bind_mouse_is_default(void);
 
 const char *bind_input_name(int slot);         // "A", "D-pad Up", "Left stick Up"
 const char *bind_pad_label(int host, int fam); // controller button in the pad family's own words (fam: input_pad_family)
 const char *bind_key_label(int scancode);
 int bind_label_family(void);                   // the connected controller's family (also on the start screen)
+int bind_prompts_auto(void);                   // what "Auto" button icons are now (PROMPTS_*)
+int input_family_of_type(int sdl_gamepad_type); // runtime/hle/input.c: 0 Nintendo, 1 Xbox (or labelled like one), 2 PS
+int input_menu_family(uint32_t sdl_joystick_id); // runtime/hle/input.c: our menus' layout for that pad (0: any)
 void bind_reset(int dev);
 bool bind_is_default(int dev);
 bool bind_is_default_slot(int dev, int slot);
@@ -67,6 +71,8 @@ int bind_pad_from_name(const char *name);
 
 // Button prompts (runtime/nvn/texpatch.c): the controller button now driving Switch input `slot` (BIND_A..)
 int bind_prompt_host(int slot);
+// The controller button Switch input `slot` is on in the default layout (by position: the Switch's A = east)
+int bind_pad_default(int slot);
 
 #ifdef __cplusplus
 }
