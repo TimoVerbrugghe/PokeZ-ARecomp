@@ -129,10 +129,11 @@ static void default_home(char *root, size_t n) {
 #ifdef _WIN32
     exe_dir(root, n);
 #elif defined(__linux__)
-    // (the AppImage is read-only): $XDG_DATA_HOME/lasrecomp, ~/.local/share/lasrecomp by default
+    // (the AppImage is read-only): $XDG_DATA_HOME/zarecomp, ~/.local/share/zarecomp by default (Pokémon Z-A: its own
+    // folder, not LAS Recomp's lasrecomp/ - both installed would share the game files' folder, saves and larecomp.ini)
     const char *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");
-    if (xdg && *xdg == '/') snprintf(root, n, "%s/lasrecomp", xdg);
-    else snprintf(root, n, "%s/.local/share/lasrecomp", home && *home ? home : "/tmp");
+    if (xdg && *xdg == '/') snprintf(root, n, "%s/zarecomp", xdg);
+    else snprintf(root, n, "%s/.local/share/zarecomp", home && *home ? home : "/tmp");
 #else
     const char *home = getenv("HOME");
     snprintf(root, n, "%s/Library/Application Support/" RT_BUNDLE_ID, home && *home ? home : "/tmp");
@@ -332,6 +333,20 @@ void rt_paths_init(void) {
     if (!getcwd(g_root, sizeof g_root)) snprintf(g_root, sizeof g_root, "%s", root);
     fprintf(stderr, "[paths] data: %s\n", g_root);
     if (!g_dev && !(env && *env)) finish_moves(g_root, NULL);
+    // Pokémon Z-A's release settings (the upscaler, the anti-aliasing, video_recommended = auto...): the app ships them
+    // as za-default.ini (tools/za/dist.sh, dist-linux.sh) and a first run copies them into the data folder as the
+    // player's larecomp.ini. The release zip no longer holds a larecomp.ini, so unzipping a new version over an install
+    // keeps the player's settings (Windows: the zip used to replace them). Not with LARECOMP_SETTINGS (test runs); a
+    // source checkout has no za-default.ini next to its executable, so nothing is copied there.
+    char def[1100];
+    if (!getenv("LARECOMP_SETTINGS") && !exists("larecomp.ini") && rt_resource("za-default.ini", NULL, def, sizeof def)) {
+        FILE *in = fopen(def, "rb"), *out = in ? fopen("larecomp.ini", "wb") : NULL;
+        char buf[4096];
+        size_t k;
+        while (out && (k = fread(buf, 1, sizeof buf, in)) > 0) fwrite(buf, 1, k, out);
+        if (in) fclose(in);
+        if (out) fclose(out), fprintf(stderr, "[paths] first run: the release's settings from %s\n", def);
+    }
 }
 
 const char *rt_data_root(void) { return g_root; }

@@ -16,6 +16,7 @@
 #include <unistd.h>
 #endif
 
+#include "../../game_addresses.h"
 #include "../../kernel.h"
 #include "shaders.h"
 #include "vk.h"
@@ -161,6 +162,35 @@ uint64_t vk_completed_seq(void) {
     return v;
 }
 
+// The indirect draws whose parameters the GPU reads in place (draw_indirect), the last IR_N of them - always on, a
+// few KB: a GPU that never finishes a submission (the 10 s stop, #70 #81 #82 #86) or loses the device shows the ones
+// still in flight with their parameters as translated and as they are now, which is what the GPU reads.
+#define IR_N 256  // (a power of two)
+static struct { uint64_t seq, pa, vs; uint32_t rec[5]; } ir_ring[IR_N];
+static unsigned ir_n;
+static void ir_note(uint64_t pa, const uint32_t *p, uint64_t vs) {
+    unsigned i = ir_n++ & (IR_N - 1);
+    ir_ring[i].seq = submit_seq + 1; ir_ring[i].pa = pa; ir_ring[i].vs = vs;
+    memcpy(ir_ring[i].rec, p, sizeof ir_ring[i].rec);
+}
+static void ir_dump(void) {
+    uint64_t done = 0;
+    // (not VK_CHECK: the device may be lost - and then the value is UINT64_MAX or garbage: every entry is shown)
+    if (vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &done) != VK_SUCCESS || done > submit_seq) done = 0;
+    unsigned lo = ir_n > IR_N ? ir_n - IR_N : 0, n = 0;
+    for (unsigned k = lo; k < ir_n; k++) n += ir_ring[k & (IR_N - 1)].seq > done;
+    LOG("[vk] indirect draws in flight (GPU done up to submission %llu): %u of the last %u\n", (unsigned long long)done, n, ir_n - lo);
+    unsigned skip = n > 48 ? n - 48 : 0;  // (the last 48 of them)
+    for (unsigned k = lo; k < ir_n; k++) {
+        const typeof(ir_ring[0]) *e = &ir_ring[k & (IR_N - 1)];
+        if (e->seq <= done) continue;
+        if (skip) { skip--; continue; }
+        const uint32_t *q = (const uint32_t *)(uintptr_t)e->pa, *w = e->rec;
+        LOG("[vk]   submission %llu vs %llx args %llx: recorded %u %u %u %d %u, now %u %u %u %d %u\n", (unsigned long long)e->seq,
+            (unsigned long long)e->vs, (unsigned long long)e->pa, w[0], w[1], w[2], (int)w[3], w[4], q[0], q[1], q[2], (int)q[3], q[4]);
+    }
+}
+
 // (LARECOMP_VK_PROF) waits on the GPU by cause: the caller names it in wait_why just before waiting
 static __thread const char *wait_why;
 static struct { const char *why; uint64_t ns, n; } wait_tab[12];
@@ -202,11 +232,14 @@ void vk_wait_seq(uint64_t seq) {
     __atomic_fetch_add(&cum_wait, waited, __ATOMIC_RELAXED);
     wait_account(waited);
     // Callers recycle command buffers and allocations after this returns; a timeout is not completion.
-    if (r == VK_TIMEOUT) FATAL("[vk] GPU did not finish submission %llu within 10 s; stopping before reusing in-flight resources\n",
-                              (unsigned long long)seq);
-    else if (r == VK_SUCCESS) cq_resolve_done(seq);  // (the game reads its timing counters after waiting)
+    if (r == VK_TIMEOUT) {
+        ir_dump();
+        FATAL("[vk] GPU did not finish submission %llu within 10 s; stopping before reusing in-flight resources\n",
+              (unsigned long long)seq);
+    } else if (r == VK_SUCCESS) cq_resolve_done(seq);  // (the game reads its timing counters after waiting)
     else {
         extern void vk_devlost_dump(void);
+        ir_dump();
         vk_devlost_dump();
         vk_device_fault_report();
         FATAL("vkWaitSemaphores: %d (device lost)\n", r);
@@ -462,6 +495,44 @@ static void xm_copy_back(VkCommandBuffer cb);
 bool g_gpuprof_frame;
 static VkQueryPool gp_qp;
 static int gp_n;
+// (debug) LARECOMP_GPU_WRITES=1: the guest memory each GPU operation may write (a compute dispatch's storage
+// buffers, a storing dispatch's copy back, transform feedback buffers, buffer copies, counters), the last GW_N of
+// them, so a block found overwritten (ind_args_bad / ib_overrun: indirect parameters holding other data, #70 #81
+// #82 #86) is logged with the operations that wrote over it in the frames before.
+#define GW_N 16384  // (a power of two)
+static struct { uint64_t lo, hi, frame, prog; const char *what; } gw_ring[GW_N];
+static unsigned gw_n;
+static int gw_on = -1;
+static void gw_note(const char *what, uint64_t lo, uint64_t size, uint64_t prog) {
+    if (gw_on < 0) gw_on = ENV("LARECOMP_GPU_WRITES") && atoi(ENV("LARECOMP_GPU_WRITES"));
+    if (!gw_on || !lo || !size) return;
+    extern uint64_t renderer_exec_frame(void);
+    unsigned i = gw_n++ & (GW_N - 1);
+    gw_ring[i].lo = lo; gw_ring[i].hi = lo + size; gw_ring[i].frame = renderer_exec_frame(); gw_ring[i].prog = prog; gw_ring[i].what = what;
+}
+static void gw_explain(uint64_t pa) {
+    static int n;
+    if (gw_on <= 0 || n >= 6) return;
+    n++;
+    extern uint64_t renderer_exec_frame(void);
+    uint64_t f = renderer_exec_frame(), plo = pa & ~0xFFFull;
+    LOG("[gpuw] frame %llu: block %llx overwritten; GPU writes over its page %llx in the last 8 frames:\n", (unsigned long long)f,
+        (unsigned long long)pa, (unsigned long long)plo);
+    unsigned lo = gw_n > GW_N ? gw_n - GW_N : 0, shown = 0;
+    for (unsigned k = lo; k < gw_n && shown < 40; k++) {
+        const typeof(gw_ring[0]) *e = &gw_ring[k & (GW_N - 1)];
+        if (e->hi <= plo || e->lo >= plo + 0x1000 || e->frame + 8 < f) continue;
+        shown++;
+        LOG("[gpuw]   frame %llu %s %llx+%llx (program %llx)%s\n", (unsigned long long)e->frame, e->what, (unsigned long long)e->lo,
+            (unsigned long long)(e->hi - e->lo), (unsigned long long)e->prog, e->lo <= pa && pa < e->hi ? " <- covers the block" : "");
+    }
+    if (!shown) LOG("[gpuw]   none: the CPU wrote it\n");
+    const uint32_t *w = (const uint32_t *)(uintptr_t)(pa & ~0x3Full);
+    LOG("[gpuw]   memory %llx:", (unsigned long long)(uintptr_t)w);
+    for (int i = 0; i < 48; i++) LOG(" %u", w[i]);
+    LOG("\n");
+}
+
 static char gp_label[512][112];
 static uint32_t gp_draws[512];
 // LARECOMP_VK_DEVLOST_TRACE=1: the last 64 GPU operations, dumped on device loss (with LARECOMP_SYNC_SUBMIT=1 the
@@ -1640,7 +1711,22 @@ static void begin_pass(void) {
         placeholder = e ? atoi(e) != 0 : g_vk.props.vendorID == 0x8086;
     }
     bool placed = false;
-    if (placeholder && !pass_ncolor && (has_d || has_s)) {
+    // The same driver on an Iris Xe (Vulkan 1.3.212) crashed there on an empty slot before a bound one ("empty color
+    // slot 0 of 2", #88): on Intel such a hole gets a throwaway attachment too (R8, which the pipelines then take for
+    // that slot: whatever the shader writes there is dropped), and so does a pass with no attachment at all
+    if (placeholder && (layers == UINT32_MAX || layers == 1)) {  // (the placeholder has one layer: not in a layered pass)
+        for (uint32_t i = 0; i < pass_ncolor; i++) {
+            if (ca[i].imageView) continue;
+            VkImageView v = vk_dummy_color_view(minw, minh, pass_samples);
+            if (!v) break;
+            ca[i] = (VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = v,
+                                                .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                                                .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE};
+            pass_color[i] = VK_FORMAT_R8_UNORM;
+            placed = true;
+        }
+    }
+    if (placeholder && !pass_ncolor) {
         VkImageView v = vk_dummy_color_view(minw, minh, pass_samples);
         if (v) {
             ca[0] = (VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = v,
@@ -3704,13 +3790,20 @@ static void snap_apply(int stage, uint32_t read_mask) {
     bool on = snap_on();
     for (int i = 0; i < 16; i++)
         if (st.sbuf[stage][i].addr && ((read_mask >> i) & 1)) bind_note(stage == 5 ? 3 : 2, st.sbuf[stage][i].addr, st.sbuf[stage][i].size);
-    if (!on) { sb_eff_on = false; return; }
+    if (!on) {
+        sb_eff_on = false;
+        if (stage == 5)
+            for (int i = 0; i < 16; i++) gw_note("compute storage", st.sbuf[5][i].addr, st.sbuf[5][i].size, st.program ? st.program->stages[5].code_addr : 0);
+        return;
+    }
     sb_eff_on = true;
     memcpy(sb_eff[stage], st.sbuf[stage], sizeof sb_eff[stage]);
     for (int i = 0; i < 16; i++) {
         Range *r = &sb_eff[stage][i];
         if (r->addr && ((read_mask >> i) & 1)) r->addr = snap_storage(r->addr, r->size, stage == 5);
     }
+    if (stage == 5)
+        for (int i = 0; i < 16; i++) gw_note("compute storage", st.sbuf[5][i].addr, st.sbuf[5][i].size, st.program ? st.program->stages[5].code_addr : 0);
 }
 
 // The driver constants of a graphics stage (cbuf 0, size bytes): zero but for the stage's storage buffer table at
@@ -3965,8 +4058,28 @@ static bool whole_import_probe_oom(void) {
 static bool gmem_import(uint64_t lo, uint64_t size) {
     VkBuffer buf;
     VkDeviceMemory mem;
-    VkResult r = host_import_ptr((void *)(uintptr_t)(gwin_base + lo), size, &buf, &mem, false);
+#ifdef _WIN32
+    // (test, #39 #72) LARECOMP_VK_GMEM_PREFAULT=1: every page of the window touched before the import - committed
+    // pages the game never wrote have no physical page yet, and a driver that maps only the pages present at the
+    // import would fault a shader's read of one. An atomic add of 0: a guest thread's store at the same moment stays.
+    const char *pf = ENV("LARECOMP_VK_GMEM_PREFAULT");
+    if (pf && atoi(pf)) {
+        uint64_t t0 = SDL_GetTicksNS();
+        for (uint64_t a = gwin_base + lo; a < gwin_base + lo + size; a += 4096) __atomic_fetch_add((volatile uint32_t *)(uintptr_t)a, 0, __ATOMIC_RELAXED);
+        LOG("[vk] gmem prefault: %llu MB touched in %llu ms (LARECOMP_VK_GMEM_PREFAULT)\n", (unsigned long long)(size >> 20),
+            (unsigned long long)((SDL_GetTicksNS() - t0) / 1000000));
+    }
+#endif
+    VkResult r = host_import_ptr((void *)(uintptr_t)(gwin_base + lo), size, &buf, &mem, g_vk.gmem_addr);
     if (r != VK_SUCCESS) { LOG("[vk] gmem import: %d (%llu MB)\n", r, (unsigned long long)(size >> 20)); return false; }
+    if (g_vk.gmem_addr) {  // (#39 #72: a page fault's address minus this start is the guest address base + lo + that)
+        VkBufferDeviceAddressInfo ai = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = buf};
+        uint64_t va = vkGetBufferDeviceAddress(g_vk.dev, &ai);
+        LOG("[vk] guest window import at device address [%#llx, %#llx) = guest [%llx, %llx)\n", (unsigned long long)va,
+            (unsigned long long)(va + size), (unsigned long long)(gwin_base + lo), (unsigned long long)(gwin_base + lo + size));
+        extern uint64_t g_gmem_va, g_gmem_guest, g_gmem_va_size;
+        g_gmem_va = va, g_gmem_guest = gwin_base + lo, g_gmem_va_size = size;
+    }
     if (gmem_buf) vk_defer_buffer(gmem_buf, gmem_mem);  // the heap grew: the pending submission may still use the old import
     gmem_buf = buf;
     gmem_mem = mem;
@@ -4184,10 +4297,13 @@ static const char *heap_tracking_reason(void) {  // (overlap_on: why there is no
 // The whole heap as one userptr import (not chunks) on AMD: each submission has amdgpu check all of its pages
 static bool heap_whole_userptr(void) { return gmem_userptr && !gc_lazy && g_vk.props.vendorID == 0x1002; }
 
-void backend_guest_heap_prepare(void) {
+void backend_guest_heap_prepare(const char *game_dir) {
     gmem_userptr = false;
 #ifdef __linux__
-    guest_heap_dmabuf();
+    // Pokémon Z-A has no heap at HEAP_BASE: reusing that buffer for its physical window makes shader reads empty.
+    // The program flag is set later in boot, so check the selected files (LARECOMP_VK_HEAP_DMABUF=0 also disables it).
+    if (game_files_are_la(game_dir)) guest_heap_dmabuf();
+    else LOG("[vk] guest heap: no driver allocation (not Link's Awakening); importing the game's physical window\n");
 #endif
     if (!g_vk.dev) return;
     gmem_chunk_shift();  // (the chunk / lazy decision, before the first draw binds anything)
@@ -4764,7 +4880,7 @@ static bool gmerge_init(void) {
                                               .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
     VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 3, .pBindings = b};
     VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &li, NULL, &gmerge_set_layout));
-    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 12};
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
     VkPipelineLayoutCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
                                      .pSetLayouts = &gmerge_set_layout, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
     VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &pi, NULL, &gmerge_layout));
@@ -4968,6 +5084,8 @@ static void gfast_prepare(VkCommandBuffer cb) {
 // After a storing dispatch: its ranges back to the heap (before anything else reads them: draws, the CPU after the fence).
 static void gfast_finish(VkCommandBuffer cb) {
     if (!gfast_n) return;
+    for (int i = 0; i < gfast_back_n; i++)
+        gw_note("compute copy back", gwin_base + gfast_back[i].dstOffset, gfast_back[i].size, st.program ? st.program->stages[5].code_addr : 0);
     vk_full_barrier(cb);
     bool merged = false;
     if (!gc_lazy && gfast_back_n && gmerge_init()) {  // (chunks: the plain copy, gmem_copy)
@@ -4987,7 +5105,10 @@ static void gfast_finish(VkCommandBuffer cb) {
         rec_CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, gmerge_pipe);
         rec_CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, gmerge_layout, 0, 1, &set, 0, NULL);
         for (int i = 0; i < gfast_back_n; i++) {
-            uint32_t pc[3] = {(uint32_t)(gfast_back[i].srcOffset / 4), (uint32_t)(gfast_back[i].dstOffset / 4), (uint32_t)(gfast_back[i].size / 4)};
+            static int cpu_wins = -1;  // (gfast_merge.comp: a word both rewrote keeps the CPU's; LARECOMP_VK_GFAST_CPU_WINS=0: the dispatch's)
+            if (cpu_wins < 0) cpu_wins = !ENV("LARECOMP_VK_GFAST_CPU_WINS") || atoi(ENV("LARECOMP_VK_GFAST_CPU_WINS")) != 0;
+            uint32_t pc[4] = {(uint32_t)(gfast_back[i].srcOffset / 4), (uint32_t)(gfast_back[i].dstOffset / 4), (uint32_t)(gfast_back[i].size / 4),
+                              (uint32_t)cpu_wins};
             rec_CmdPushConstants(cb, gmerge_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
             rec_CmdDispatch(cb, (pc[2] + 255) / 256, 1, 1);
         }
@@ -6424,6 +6545,7 @@ static void draw(CmdRec *r, bool indexed) {
         // the transform feedback buffers are GPU-written: never served from the vertex cache's CPU-side copies (later
         // draws read them as vertex streams - Z-A's characters take their per-instance data from them; a stale copy
         // froze their animation and stretched their meshes)
+        for (int b = 0; b < 4; b++) gw_note("transform feedback", xfb_addr[b], xfb_size[b], st.program ? st.program->stages[0].code_addr : 0);
         for (int b = 0; b < 4; b++)
             if (xfb_addr[b] >= gwin_base && xfb_size[b] && xfb_addr[b] - gwin_base < gwin_max)
                 vc_mark_gpu(xfb_addr[b] - gwin_base, xfb_addr[b] - gwin_base + xfb_size[b]);
@@ -7171,6 +7293,34 @@ static bool ib_overrun(CmdRec *r, const uint32_t *p, uint64_t pa) {
             (unsigned long long)stride, (unsigned long long)st.vbuf[s].addr, (unsigned long long)st.vbuf[s].size,
             (unsigned long long)(st.vbuf[s].size / stride));
     }
+    gw_explain(pa);
+    stat_skipped_here();
+    return true;
+}
+// Parameters no draw can have, in blocks the GPU reads in place (#70 #81 #82 #86: the GPU stopped for 10 s, or the
+// device was lost, where blocks held other data for frames on end - every field near one small number, a base
+// instance in the hundreds of thousands): a count over 4M (ib_overrun leaves those alone), or a base instance whose
+// first element already lies past a per-instance stream's buffer (the instance attributes read far beyond it).
+// Checked as the CPU sees them, as ib_overrun (the base instance is the CPU's; only the instance count is the GPU's),
+// and skipped; LARECOMP_IB_GUARD=0 draws them.
+static bool ind_args_bad(const uint32_t *p, uint64_t pa, bool elements) {
+    static int on = -1;
+    if (on < 0) on = !ENV("LARECOMP_IB_GUARD") || atoi(ENV("LARECOMP_IB_GUARD")) != 0;
+    if (!on) return false;
+    uint32_t binst = elements ? p[4] : p[3];
+    const char *why = p[0] > (1u << 22) ? "count over 4M" : NULL;
+    for (int a = 0; a < st.nattrib && !why; a++) {
+        if (!(st.attrib[a] & 0xFF)) continue;
+        uint32_t s = st.attrib[a] >> 8 & 0x1F, off = st.attrib[a] >> 13;
+        if (s >= (uint32_t)st.nstream || !st.stream[s][1] || !st.stream[s][0] || !st.vbuf[s].size) continue;
+        if ((uint64_t)binst * st.stream[s][0] + off + 4 > st.vbuf[s].size) why = "base instance past an instance stream";
+    }
+    if (!why) return false;
+    static int nlog;
+    if (nlog++ < 60)
+        LOG("[ibguard] frame %llu: skipped draw (%s): args %llx = %u %u %u %d %u\n", (unsigned long long)renderer_present_count(),
+            why, (unsigned long long)pa, p[0], p[1], p[2], (int)p[3], elements ? p[4] : 0);
+    gw_explain(pa);
     stat_skipped_here();
     return true;
 }
@@ -7233,7 +7383,8 @@ static void draw_indirect(CmdRec *r) {
                 LOG("[vk] gpu args %llx: count %u instances %u first %u base %d base inst %u (cpu: %u %u)\n", (unsigned long long)pa,
                     q[0], q[1], q[2], (int)q[3], q[4], p[0], p[1]);
             }
-            if (elements && ib_overrun(r, p, pa)) continue;
+            if (ind_args_bad(p, pa, elements) || (elements && ib_overrun(r, p, pa))) continue;
+            ir_note(pa, p, st.program ? st.program->stages[0].code_addr : 0);
             g_ind_gpu = true; g_ind_off = GM_OFF(pa); g_ind_stride = stride;
             d.x[0] = r->x[0];
             if (elements) {
@@ -7464,7 +7615,30 @@ static void depth_blit_via_color(VkCommandBuffer cb, TexBackend *s, TexBackend *
     rec_CmdCopyBufferToImage(cb, buf, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
 }
 
+static void copy_texture_gpu(const TexRefRec *src, const TexRefRec *dst, uint64_t flags);
+// A copy into a pitch-linear texture (a stride: memory the CPU reads as it is) also lands in guest memory, read back
+// with the texture's own row pitch. Royale Z-A's profile photo: the frame is copied into a 1920x1080 linear RGBA8
+// texture, the CPU maps that memory, crops it to 852x444 and encodes it to BC1 itself (game fn 0x700189a880,
+// blocks by 0x700189bfb0): with the copy only in the Vulkan image the CPU read zeros - a black photo, saved black
+// (#64). Rare (one copy per photo), so the wait for the GPU is fine. LARECOMP_VK_LINEAR_WRITEBACK=0: the image only.
 static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t flags) {
+    copy_texture_gpu(src, dst, flags);
+    NvnTexture *dt = (NvnTexture *)(uintptr_t)dst->tex;
+    static int on = -1;
+    if (on < 0) on = !ENV("LARECOMP_VK_LINEAR_WRITEBACK") || atoi(ENV("LARECOMP_VK_LINEAR_WRITEBACK")) != 0;
+    if (!on || !dt || !dt->stride || dt->addr < GUEST_LO || (dst->has_view && (dst->view.setmask & 1) && dst->view.base_level))
+        return;
+    const FormatInfo *fi = nvn_format_info(dt->format);
+    if (!fi || fi->bw != 1 || fi->bh != 1 || !fi->bpb || fi->bpb == 3 || dt->stride < (uint64_t)dt->width * fi->bpb) return;
+    TexRefRec whole = *dst;  // (the whole image: the rows the CPU sees, at the texture's pitch)
+    memset(whole.region, 0, sizeof whole.region);
+    uint64_t row = st.copy_row_stride, img = st.copy_image_stride;
+    st.copy_row_stride = dt->stride, st.copy_image_stride = dt->stride * dt->height;
+    copy_texture_to_buffer(&whole, dt->addr);
+    st.copy_row_stride = row, st.copy_image_stride = img;
+}
+
+static void copy_texture_gpu(const TexRefRec *src, const TexRefRec *dst, uint64_t flags) {
     snap_reason = "tex2tex"; snapshots_invalidate(NULL);
     NvnTexture *st_ = (NvnTexture *)(uintptr_t)src->tex, *dt = (NvnTexture *)(uintptr_t)dst->tex;
     if (!st_ || !dt) return;
@@ -9109,6 +9283,7 @@ static void exec_list(uint64_t handle, int depth) {
             extern uint64_t vk_frame_counter(void);
             if (mode == 1 && vk_frame_counter() != frame_seen) { frame_seen = vk_frame_counter(); frame_ts = ns_to_gpu_ticks(plat_now_ns()); }
             if (!out) break;
+            gw_note("report counter", (uint64_t)(uintptr_t)out, 16, type);
             out[0] = 0;
             // SAMPLES_PASSED (occlusion queries: Pokémon Z-A tests its objects with point draws and skips those that
             // pass no samples): no occlusion queries here, so a count that always grows - every object visible
@@ -9149,6 +9324,7 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_COPY_BUFFER_TO_BUFFER:
             wait_why = "buffer -> buffer copy";
             renderer_flush();
+            gw_note("buffer copy (CPU, at translation)", r->x[1], r->x[2], r->x[0]);
             memmove((void *)(uintptr_t)r->x[1], (void *)(uintptr_t)r->x[0], r->x[2]);
             break;
         default: break;

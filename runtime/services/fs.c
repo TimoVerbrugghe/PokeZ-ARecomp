@@ -21,6 +21,8 @@
 #include "../settings.h"
 #include "../ipc.h"
 #include "../romfs_build.h"
+#include "../input_bind.h"
+#include "../xbox_attack_layout.h"
 
 #ifndef O_BINARY
 #define O_BINARY 0
@@ -245,10 +247,56 @@ static void rom_dir_path(const uint8_t *dmeta, uint32_t dsize, uint32_t dir, cha
 // Pokémon Z-A keeps its files in packs (arc/data.trpfs) listed by arc/data.trpfd, and reads a file from the RomFS
 // only when the list doesn't have it: so the game's data.trpfd is served without the layered files' entries
 // (trpfd_unlist). A mod's own data.trpfd is never used (it's made for the mod's game version).
-static char layer_root[16][1100];
+static char layer_root[17][1100];  // seed + optional Xbox presentation + 15 user mods
 static int nlayers = -1;
 static bool trinity;  // the RomFS has arc/data.trpfd
-RT_ON_RESET(layer_reset) { nlayers = -1; trinity = false; }
+static uint8_t *xbox_arc;
+static XboxAttackResource xbox_resource;
+RT_ON_RESET(layer_reset) { nlayers = -1; trinity = false; free(xbox_arc); xbox_arc = NULL; }
+
+// Called only when indexing the RomFS. Verify the current game's packed source,
+// not merely the installed overlay, so another game version keeps its own UI.
+static bool xbox_layer_prepare(void) {
+    if (!g_settings.xbox_attack_layout) return false;
+    const char *why = NULL;
+    uint8_t mapping[4];
+    if (g_settings.battle_abxy_position) why = "Battle moves by position must be OFF (controls are unchanged)";
+    else if (!xbox_attack_mapping(g_bind_pad, mapping)) why = "four distinct face bindings required";
+    RomFile *pack = NULL;
+    for (int i = 0; i < rom_nfiles && !pack; i++)
+        if (!strcmp(rom_files[i].path, "arc/data.trpfs")) pack = &rom_files[i];
+    if (!why && !pack) why = "unsupported source pack";
+    if (why) { LOG("[xbox-layout] disabled: %s\n", why); return false; }
+    uint8_t meta[XBOX_ATTACK_METADATA_SIZE];
+    FILE *mf = fopen(XBOX_ATTACK_METADATA, "rb");
+    if (!mf) { LOG("[xbox-layout] disabled: automatic preparation missing (textures/prompts.log)\n"); return false; }
+    bool meta_ok = fread(meta, 1, sizeof meta, mf) == sizeof meta && fgetc(mf) == EOF && !ferror(mf) &&
+                   xbox_attack_resource(meta, sizeof meta, &xbox_resource);
+    fclose(mf);
+    if (!meta_ok) { LOG("[xbox-layout] disabled: invalid resource metadata\n"); return false; }
+    XboxAttackResource *xr = &xbox_resource;
+    if (xr->pack_offset > pack->size || xr->pack_size > pack->size - xr->pack_offset ||
+        pack->off > UINT64_MAX - xr->pack_offset - xr->pack_size) {
+        LOG("[xbox-layout] disabled: source range out of bounds\n"); return false;
+    }
+    uint8_t *packed = malloc((size_t)xr->pack_size);
+    if (!packed) { LOG("[xbox-layout] disabled: allocation failed\n"); return false; }
+    bool source_ok = base_pread(packed, xr->pack_size, pack->off + xr->pack_offset) == (ssize_t)xr->pack_size &&
+                     xbox_attack_fnv(packed, (size_t)xr->pack_size) == xr->pack_fnv;
+    free(packed);
+    if (!source_ok) { LOG("[xbox-layout] disabled: source resource/version mismatch\n"); return false; }
+    FILE *f = fopen(XBOX_ATTACK_HOST, "rb");
+    if (!f) { LOG("[xbox-layout] disabled: missing %s\n", XBOX_ATTACK_HOST); return false; }
+    uint8_t *data = malloc((size_t)xr->arc_size);
+    bool ok = data && fread(data, 1, (size_t)xr->arc_size, f) == xr->arc_size && fgetc(f) == EOF && !ferror(f);
+    fclose(f);
+    if (ok) ok = xbox_attack_relabel(data, (size_t)xr->arc_size, g_bind_pad, xr, &why);
+    if (!ok) { free(data); LOG("[xbox-layout] disabled: %s\n", why ? why : "unreadable overlay"); return false; }
+    xbox_arc = data;
+    LOG("[xbox-layout] enabled: top=%u right=%u left=%u bottom=%u (pane identities; controls unchanged)\n",
+        mapping[0], mapping[1], mapping[2], mapping[3]);
+    return true;
+}
 
 static int name_cmp(const void *a, const void *b) { return strcmp((const char *)a, (const char *)b); }
 // mods_order's place (unlisted: after every listed one), then the name
@@ -271,6 +319,8 @@ static int mod_cmp(const void *a, const void *b) {
 static void layer_init(void) {
     if (nlayers >= 0) return;
     nlayers = 0;
+    settings_load();
+    if (xbox_layer_prepare()) strlcpy(layer_root[nlayers++], XBOX_ATTACK_ROOT, sizeof *layer_root);
     const char *seed = rando_seed_dir();
     if (seed) snprintf(layer_root[nlayers++], sizeof *layer_root, "%s/romfs", seed);
     DIR *d = opendir("mods");
@@ -675,6 +725,17 @@ static void rom_index(void) {
     if (ov_meta) { patches[npatches++] = (Patch){ov_meta_off, ov_meta_size, ov_meta}; }
     rt_romfs_files = rom_nfiles;  // (the game's own: before a seed's added files; the crash dialog checks it)
     add_new_files(h, dmeta, dsz, fsz);
+    // The hidden mod is ignored by the normal Mods scan. Only the opt-in layer
+    // above exposes it, and the game reads its verified, renamed copy in memory.
+    if (xbox_arc) {
+        int replaced = 0;
+        for (int i = 0; i < ov_n; i++)
+            if (ov[i].path && !strcmp(ov[i].path, XBOX_ATTACK_HOST) && ov[i].size == xbox_resource.arc_size) {
+                ov[i].mem = xbox_arc;
+                replaced++;
+            }
+        LOG("[xbox-layout] %d battle resource overlay mounted\n", replaced);
+    }
     qsort(rom_files, rom_nfiles, sizeof *rom_files, rom_cmp);
     free(dmeta);
     free(fmeta);

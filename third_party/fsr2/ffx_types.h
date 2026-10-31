@@ -22,7 +22,7 @@
 #pragma once
 
 #include <stdint.h>
-#include <stddef.h>
+#include <stddef.h>  // (ZA Recomp: size_t below; MSVC's stdint.h brings it in, glibc's does not)
 
 #if defined (FFX_GCC) || !defined(_WIN32)
 /// FidelityFX exported functions

@@ -41,6 +41,7 @@ extern "C" {
 #include "romfs_build.h"
 #include "settings.h"
 #include "input_bind.h"
+#include "xbox_attack_layout.h"
 bool controls_ui_took_back(void);  // ui/controls_ui.mm: B went back a step on Configure inputs
 void input_mouse_release(SDL_Window *w);   // runtime/hle/input.c
 void ui_window_init(void);
@@ -100,7 +101,7 @@ static const char *build_version(const uint8_t id[8]) {
 static bool build_is_za(const uint8_t id[8]) { return build_version(id) && memcmp(id, BUILD_ID, 8); }
 // The release tag this build is (also names the release files; Makefile / tools/bundle_macos.sh / make_dmg.sh read
 // it): ZA Recomp's v<major>.<minor>.<patch> (Hexveil404/PokeZ-ARecomp releases).
-#define LARECOMP_VERSION "v0.1.12"
+#define LARECOMP_VERSION "v0.1.13"
 extern "C" const char *rt_version(void) { return LARECOMP_VERSION; }  // (runtime/main.c: the log's first line)
 extern "C" const char *larecomp_version(void) { return LARECOMP_VERSION; }  // (the shader caches' tag)
 
@@ -667,7 +668,7 @@ static bool import_packages(const std::vector<std::string> &pkgs, const std::str
 // Controls tab (both in the background: from the next start). zaprompts --install draws them into textures/prompts.new
 // and swaps that in whole itself (a game never sees half a set). Up to 3 tries per stamp (textures/prompts.tried):
 // failing leaves the game's own icons. Log: textures/prompts.log.
-#define PROMPTS_VERSION "3"
+#define PROMPTS_VERSION "4-xbox1"
 static std::atomic<bool> g_prompts_busy{false};
 static PlatProc g_prompts_proc;  // (the one left running: a newer rebind ends it and starts over)
 static std::string prompts_stamp(void) {
@@ -677,6 +678,20 @@ static std::string prompts_stamp(void) {
     };
     mix(g_bind_pad, sizeof g_bind_pad);
     mix(g_bind_key, sizeof g_bind_key);
+    // An imported/replaced game must regenerate its private resources too, even
+    // when bindings did not change. Runtime still verifies the actual source bytes.
+    for (const char *name : {"/romfs.bin", "/exefs/main"}) {
+        struct stat sb;
+        uint64_t identity[2] = {0, 0};
+        if (!stat((g_root + name).c_str(), &sb)) identity[0] = sb.st_size, identity[1] = sb.st_mtime;
+        mix(identity, sizeof identity);
+    }
+    uint8_t build_id[32] = {0};  // NSO build ID: updates with preserved size/mtime must not reuse old assets
+    if (FILE *f = fopen((g_root + "/exefs/main").c_str(), "rb")) {
+        if (!fseek(f, 0x40, SEEK_SET)) fread(build_id, 1, sizeof build_id, f);
+        fclose(f);
+    }
+    mix(build_id, sizeof build_id);
     char s[48];
     snprintf(s, sizeof s, "%s-%016llx", PROMPTS_VERSION, (unsigned long long)h);
     return s;
@@ -687,10 +702,27 @@ static bool prompts_marked(const char *path, int *tries = NULL) {
     if (!f) return false;
     char v[48] = "";
     int n = 0;
-    bool ok = fscanf(f, "%47s %d", v, &n) >= 1 && prompts_stamp() == v;
+    bool ok = fscanf(f, "%47s %d", v, &n) >= (tries ? 2 : 1) && prompts_stamp() == v;
     fclose(f);
     if (tries) *tries = ok ? n : 0;
     return ok;
+}
+// A negative preparation is remembered only for this game/helper stamp. An
+// unsupported layout must not make every launch redraw all controller icons.
+static bool xbox_layout_wanted(void) {
+    int ready = 0;
+    if (!prompts_marked(XBOX_ATTACK_STATUS, &ready)) return true;
+    if (!ready) return false;
+    if (ready != 1) return true;
+    uint8_t bytes[XBOX_ATTACK_METADATA_SIZE];
+    XboxAttackResource xr;
+    FILE *f = fopen(XBOX_ATTACK_METADATA, "rb");
+    if (!f) return true;
+    bool ok = fread(bytes, 1, sizeof bytes, f) == sizeof bytes && fgetc(f) == EOF && !ferror(f) &&
+              xbox_attack_resource(bytes, sizeof bytes, &xr);
+    fclose(f);
+    struct stat sb;
+    return !ok || stat(XBOX_ATTACK_HOST, &sb) || (uint64_t)sb.st_size != xr.arc_size;
 }
 // (3 tries: a game closed before zaprompts is done may end it with the process)
 static bool prompts_wanted(void) {
@@ -732,11 +764,29 @@ static bool make_prompts(bool wait) {
     g_prompts_busy = false;
     return r == 0;
 }
+// The Xbox battle layout (only with its option on): zaprompts takes the one battle archive out of the game into
+// mods/_XboxAttackLayout before the game mounts the RomFS. Only that archive, not the icons: a second or two.
+static void xbox_layout_before_play(void) {
+    if (!g_settings.xbox_attack_layout || !xbox_layout_wanted()) return;
+    char tool[1100];
+    if (!rt_resource("zaprompts/zaprompts" PLAT_EXE_SUFFIX, "build/helper/zaprompts/zaprompts" PLAT_EXE_SUFFIX, tool, sizeof tool) ||
+        !file_exists(g_root + "/romfs.bin"))
+        return;
+    mkdir("textures", 0755);
+    std::string stamp = prompts_stamp(), romfs = g_root + "/romfs.bin";
+    const char *argv[] = {tool, "--romfs", romfs.c_str(), "--mods", "mods", "--install", stamp.c_str(),
+                          "--xbox-attack-layout-only", NULL};
+    PlatProc p = plat_spawn(argv, "textures/xbox-layout.log", false);
+    int r = p ? plat_proc_wait(p, true) : -1;
+    fprintf(stderr, "[launcher] Xbox battle layout: %s (zaprompts exit %d; textures/xbox-layout.log)\n",
+            r == 0 ? "prepared" : "not prepared", r);
+}
 // runtime/main.c, a set-up copy booting straight into the game: the icons made in the background if they never were,
 // or were made for other bindings
 extern "C" void launcher_prompts_kick(const char *root) {
     g_root = root;
     settings_load();  // (the bindings: the boot loads them later, runtime/main.c boot)
+    xbox_layout_before_play();
     if (prompts_wanted()) make_prompts(false);
 }
 // runtime/ui/controls_ui.mm, a binding changed (larecomp.ini saved): the icons made again for it, from the next start
@@ -1598,6 +1648,7 @@ static void draw_art(ImDrawList *dl, ImVec2 o, ImVec2 ds) {
 
 // ---- first PLAY ever: the aspect ratio question, then how to open the in-game menu
 static bool g_tip_test;  // (LARECOMP_LAUNCHER_SHOT=<frame>:tip / :aspect)
+static bool g_video_test;  // (LARECOMP_LAUNCHER_SHOT=<frame>:video - the recommended video settings question)
 static bool begin_question(const char *id, float s) {
     ImVec2 ds = ImGui::GetIO().DisplaySize;
     ImGui::SetNextWindowPos(ImVec2(ds.x * 0.5f, ds.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
@@ -1632,6 +1683,57 @@ static bool aspect_prompt(float s) {
         if (pick >= 0) {
             g_settings.aspect = pick;
             g_settings.aspect_asked = true;
+            settings_save();
+            ImGui::CloseCurrentPopup();
+            done = true;
+        }
+        ImGui::EndPopup();
+    }
+    return done;
+}
+// ---- first PLAY with a settings file from before the recommendation: offer this PC's video settings (settings.c
+// settings_video_recommend). Either answer is kept (video_recommended = done): asked once.
+static const char *res_label(int m) {
+    static char b[2][24];
+    static int k;
+    char *o = b[k ^= 1];
+    const char *n = settings_res_name(m);
+    if (!strcmp(n, "match")) snprintf(o, 24, "%s", TR("the window's", "a da janela"));
+    else snprintf(o, 24, "%s", n);
+    return o;
+}
+static bool video_prompt(float s) {
+    bool done = false;
+    if (begin_question("##videorec", s)) {
+        const VideoRec *r = &g_video_rec;
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextUnformatted(TR("Recommended video settings for your PC", "Configurações de vídeo recomendadas para o seu PC"));
+        ImGui::Spacing();
+        ImGui::TextDisabled("%s (%s %s)", r->gpu, TR("profile", "perfil"), video_profile_name(r->profile, g_pt));
+        ImGui::Spacing();
+        auto fps_text = [](bool fps60, bool lock) {
+            return !fps60 ? "30 fps" : lock ? TR("60 fps (stays at 60)", "60 fps (sem cair para 30)")
+                                            : TR("60 fps (drops to 30 when needed)", "60 fps (cai para 30 quando preciso)");
+        };
+        ImGui::Text("%s  %s %s, %s", TR("Recommended:", "Recomendado:"), TR("resolution", "resolução"), res_label(r->res_mode),
+                    fps_text(r->fps60, r->fps60));
+        ImGui::TextDisabled("%s  %s %s, %s", TR("Now:", "Agora:"), TR("resolution", "resolução"), res_label(g_settings.res_mode),
+                            fps_text(g_settings.fps60, g_settings.fps60_lock));
+        ImGui::Spacing();
+        ImGui::TextDisabled("%s", TR("You can change this any time in Settings.", "Dá para mudar quando quiser em Configurações."));
+        ImGui::PopTextWrapPos();
+        ImGui::Dummy(ImVec2(0, 14 * s));
+        float bw = 300 * s, gap = 20 * s;
+        ImGui::SetCursorPosX((ImGui::GetWindowWidth() - 2 * bw - gap) * 0.5f);
+        int pick = -1;
+        ImGui::SetItemDefaultFocus();
+        if (ImGui::Button(TR("Use the recommended", "Usar as recomendadas"), ImVec2(bw, 44 * s))) pick = 1;
+        ImGui::SameLine(0, gap);
+        if (ImGui::Button(TR("Keep mine", "Manter as minhas"), ImVec2(bw, 44 * s))) pick = 0;
+        if (pick >= 0) {
+            if (pick) settings_video_apply_recommended();
+            fprintf(stderr, "[launcher] recommended video settings %s\n", pick ? "applied" : "declined");
+            g_settings.video_rec = VREC_DONE;
             settings_save();
             ImGui::CloseCurrentPopup();
             done = true;
@@ -2222,6 +2324,7 @@ extern "C" void launcher_run(const char *root) {
         if (pg && !strncmp(pg + 1, "fail", 4)) g_changing_folder = true, set_failure(atoi(pg + 5));  // (the failure messages)
         if (pg && !strncmp(pg + 1, "tip", 3)) g_settings.menu_tip_seen = false, g_tip_test = true;
         if (pg && !strncmp(pg + 1, "aspect", 6)) g_settings.aspect_asked = g_settings.menu_tip_seen = false, g_tip_test = true;
+        if (pg && !strncmp(pg + 1, "video", 5)) g_settings.video_rec = VREC_ASK, g_video_test = true;
     }
 
     static int runs;  // (test: =once - only the first time, so a "Title screen" reboot lands on the start screen)
@@ -2601,12 +2704,23 @@ extern "C" void launcher_run(const char *root) {
                     party_icons_kick();
                     party_panel(dl, x, ty + 68 + 34, w);
                     if (g_play_pending) pressed = true, g_play_pending = false;
-                    if (pressed) {  // first PLAY ever: the aspect ratio question, then how to reach our menu
-                        if (!g_settings.aspect_asked) ImGui::OpenPopup("##aspect");
+                    // (a settings file from before the recommendation that already holds it: nothing to offer)
+                    if (g_settings.video_rec == VREC_ASK && g_video_rec.known && settings_video_matches_recommended())
+                        g_settings.video_rec = VREC_DONE, settings_save();
+                    bool offer_video = g_settings.video_rec == VREC_ASK && g_video_rec.known;
+                    if (pressed) {  // first PLAY ever: this PC's video settings, the aspect ratio question, how to reach our menu
+                        if (offer_video) ImGui::OpenPopup("##videorec");
+                        else if (!g_settings.aspect_asked) ImGui::OpenPopup("##aspect");
                         else if (!g_settings.menu_tip_seen) ImGui::OpenPopup("##menutip");
                         else play = true;
                     }
                     if (g_tip_test) ImGui::OpenPopup(g_settings.aspect_asked ? "##menutip" : "##aspect"), g_tip_test = false;
+                    if (g_video_test && g_video_rec.known) ImGui::OpenPopup("##videorec"), g_video_test = false;
+                    if (video_prompt(s)) {
+                        if (!g_settings.aspect_asked) ImGui::OpenPopup("##aspect");
+                        else if (!g_settings.menu_tip_seen) ImGui::OpenPopup("##menutip");
+                        else play = true;
+                    }
                     if (aspect_prompt(s)) {
                         if (g_settings.menu_tip_seen) play = true;
                         else ImGui::OpenPopup("##menutip");
@@ -3078,6 +3192,7 @@ extern "C" void launcher_run(const char *root) {
     }
     // play: hand the window to the game
     settings_save();
+    xbox_layout_before_play();
 #ifdef __APPLE__
     ImGui_ImplMetal_Shutdown();
 #else
